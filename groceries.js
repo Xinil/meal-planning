@@ -21,7 +21,7 @@
  * (also accepts {"items": [...]}) — use it to push a recipe's ingredients in one shot.
  */
 const fs = require('fs');
-const { rawLists } = require('./anylist-patch'); // must load before AnyList is used
+const { rawLists, addItems, removeItems, saveItems } = require('./anylist-patch'); // must load before AnyList is used
 const { installSyncCache, describeError } = require('./anylist-cache');
 const { assign: assignCategory } = require('./categorize');
 const AnyList = require('anylist');
@@ -29,7 +29,12 @@ const AnyList = require('anylist');
 const EMAIL = process.env.ANYLIST_EMAIL;
 const PASSWORD = process.env.ANYLIST_PASSWORD;
 const DEFAULT_LIST = process.env.ANYLIST_DEFAULT_LIST || 'Shared Grocery List';
-const CACHE_TTL_MS = Number(process.env.ANYLIST_CACHE_TTL_MS || 300000); // 5 min
+// Sync economics: a 15 min cache means a burst of read commands costs one sync,
+// and the budget stops an agent loop from hammering the endpoint the vendor
+// throttles (they email account owners about "excessive downloading").
+const CACHE_TTL_MS = Number(process.env.ANYLIST_CACHE_TTL_MS || 900000); // 15 min
+const MAX_SYNCS_PER_HOUR = Number(process.env.ANYLIST_MAX_SYNCS_PER_HOUR || 10);
+const MIN_SYNC_INTERVAL_MS = Number(process.env.ANYLIST_MIN_SYNC_INTERVAL_MS || 45000);
 
 if (!EMAIL || !PASSWORD) {
   fail('Missing ANYLIST_EMAIL / ANYLIST_PASSWORD in environment');
@@ -73,10 +78,14 @@ function parseArgs(argv) {
 // The library builds List/Item objects from `any.uid` at construction time, so
 // the user id must be injected BEFORE getLists(), otherwise write operations go
 // out with userId=undefined and the server rejects them.
-async function connect() {
+async function connect(refresh = false) {
   await any.login(false); // no websocket: one-shot CLI
-  syncCache = installSyncCache(any, { ttlMs: CACHE_TTL_MS });
-  await any.getRecipes(false); // warms _userData (recipes + list settings + lists); cached when fresh
+  syncCache = installSyncCache(any, {
+    ttlMs: CACHE_TTL_MS,
+    maxPerHour: MAX_SYNCS_PER_HOUR,
+    minIntervalMs: MIN_SYNC_INTERVAL_MS,
+  });
+  await any.getRecipes(refresh); // warms _userData (recipes + list settings + lists); cached when fresh
   const settings = any._userData && any._userData.listSettingsResponse
     ? any._userData.listSettingsResponse.settings
     : null;
@@ -84,7 +93,23 @@ async function connect() {
     fail('Could not resolve AnyList user id from account data');
   }
   any.uid = settings[0].userId;
-  await any.getLists(false); // reuse cached blob, now with uid set
+  await any.getLists(false); // reuse the cached blob, now with uid set
+}
+
+// What this command cost the AnyList API, so the agent can see the load it caused
+// (and so a stale read is never mistaken for live data).
+function syncMeta() {
+  const info = (syncCache && syncCache.info) || {};
+  const stats = (syncCache && syncCache.stats) || {};
+  return {
+    fromCache: info.fromCache === true,
+    dataAgeSeconds: info.ageSeconds === null || info.ageSeconds === undefined ? null : info.ageSeconds,
+    stale: info.stale === true,
+    syncs: stats.syncs || 0,
+    writes: stats.writes || 0,
+    verified: verificationNote === null,
+    verificationNote: verificationNote || undefined,
+  };
 }
 
 // Categories available on this account (system slugs, e.g. "produce"); used when
@@ -104,9 +129,21 @@ async function refresh() {
 
 // Invalidate the cached sync blob, then read the list back from the server so the
 // command reports what actually landed.
+let verificationNote = null;
+
 async function afterWrite() {
   if (syncCache) syncCache.invalidate();
-  return refresh();
+  verificationNote = null;
+  try {
+    return await refresh();
+  } catch (e) {
+    // The write POST already succeeded; only the read-back sync was refused.
+    if (e && e.retryAfterMs) {
+      verificationNote = 'write accepted but not read back: ' + e.message;
+      return rawLists(any);
+    }
+    throw e;
+  }
 }
 
 // --- list resolution ---------------------------------------------------------
@@ -167,12 +204,12 @@ function writeItem(listId, itemId) {
 
 // --- item creation / reuse ---------------------------------------------------
 // Mirrors the official client: if an item with that name already exists
-// (checked off or not), reuse it instead of creating a duplicate.
-async function addOne(list, spec, report, categories) {
+// (checked off or not), reuse it instead of creating a duplicate. New items are
+// only staged here; the caller flushes them in one batched POST.
+async function prepareItem(list, spec, categories) {
   const name = String(spec.name || '').trim();
   if (!name) {
-    report.push({ name: spec.name, status: 'skipped', reason: 'empty name' });
-    return;
+    return { result: { name: spec.name, status: 'skipped', reason: 'empty name' } };
   }
 
   const quantity = spec.quantity === undefined || spec.quantity === null || spec.quantity === ''
@@ -189,42 +226,46 @@ async function addOne(list, spec, report, categories) {
   const existing = findItem(list, name);
   if (existing) {
     const target = writeItem(list.id, existing.id);
+    const fields = [];
     const changes = [];
 
     if (existing.checked) {
-      target.checked = false;
+      fields.push({ field: 'checked', value: false });
       changes.push('unchecked');
     }
     if (quantity && existing.quantity !== quantity) {
-      target.quantity = quantity;
+      fields.push({ field: 'quantity', value: quantity });
       changes.push('quantity');
     }
     if (details && existing.details !== details) {
-      target.details = details;
+      fields.push({ field: 'details', value: details });
       changes.push('details');
     }
 
-    if (changes.length) await target.save();
-    report.push({
-      name: existing.name,
-      status: changes.length ? 'updated' : 'already-present',
-      quantity: quantity || existing.quantity,
-      category: existing.categoryMatchId || undefined,
-      changes: changes.length ? changes : undefined,
-    });
-    return;
+    return {
+      update: fields.length ? { item: target, fields } : null,
+      result: {
+        name: existing.name,
+        status: changes.length ? 'updated' : 'already-present',
+        quantity: quantity || existing.quantity,
+        category: existing.categoryMatchId || undefined,
+        changes: changes.length ? changes : undefined,
+      },
+    };
   }
 
   const draft = any.createItem({ name, quantity, details });
   if (category && category !== 'other') draft.categoryMatchId = category;
-  const item = await writeList(list.id).addItem(draft);
-  report.push({
-    name: item.name,
-    status: 'added',
-    quantity: quantity,
-    details: details,
-    category: category || undefined,
-  });
+  return {
+    draft,
+    result: {
+      name,
+      status: 'added',
+      quantity,
+      details,
+      category: category || undefined,
+    },
+  };
 }
 
 function readSpecs(flags) {
@@ -250,7 +291,7 @@ async function main() {
   const action = process.argv[2] || 'lists';
   const { positional, flags } = parseArgs(process.argv.slice(3));
 
-  await connect();
+  await connect(flags.fresh === true);
   let lists = rawLists(any);
   const categories = availableCategories();
   // List can be given positionally (first arg) or as --list, which lets the first
@@ -260,7 +301,7 @@ async function main() {
 
   switch (action) {
     case 'lists':
-      return out({ ok: true, count: lists.length, lists: lists.map(summary) });
+      return out({ ok: true, count: lists.length, lists: lists.map(summary), api: syncMeta() });
 
     case 'items': {
       const list = resolveList(lists, listArg);
@@ -272,6 +313,7 @@ async function main() {
         list: summary(list),
         count: items.length,
         items,
+        api: syncMeta(),
       });
     }
 
@@ -279,13 +321,15 @@ async function main() {
       const list = resolveList(lists, listArg);
       const name = nameArgs.join(' ').trim();
       if (!name) fail('Usage: node groceries.js add <list> <item name> [--qty Q] [--details D] [--category slug]');
-      const report = [];
-      await addOne(list, { name, quantity: flags.qty, details: flags.details, category: flags.category }, report, categories);
+      const { draft, update, result } = await prepareItem(list, { name, quantity: flags.qty, details: flags.details, category: flags.category }, categories);
+      if (draft) await addItems(writeList(list.id), [draft]);
+      if (update) await saveItems(writeList(list.id), [update]);
       lists = await afterWrite();
       return out({
         ok: true,
         list: summary(resolveList(lists, list.id)),
-        result: report[0],
+        result,
+        api: syncMeta(),
       });
     }
 
@@ -293,13 +337,21 @@ async function main() {
       const list = resolveList(lists, listArg);
       const specs = readSpecs(flags);
       const report = [];
+      const drafts = [];
+      const updates = [];
       for (const spec of specs) {
         try {
-          await addOne(list, spec, report, categories);
+          const { draft, update, result } = await prepareItem(list, spec, categories);
+          if (draft) drafts.push(draft);
+          if (update) updates.push(update);
+          report.push(result);
         } catch (e) {
           report.push({ name: spec.name, status: 'error', error: e.message });
         }
       }
+      // One POST for every new item, one for every field change — not one per item.
+      await addItems(writeList(list.id), drafts);
+      await saveItems(writeList(list.id), updates);
       lists = await afterWrite();
       return out({
         ok: true,
@@ -310,6 +362,7 @@ async function main() {
           return acc;
         }, {}),
         results: report,
+        api: syncMeta(),
       });
     }
 
@@ -319,12 +372,13 @@ async function main() {
       if (!name) fail('Usage: node groceries.js remove <list> <item name>');
       const item = findItem(list, name);
       if (!item) fail(`Item "${name}" not found in list "${list.name}"`);
-      await writeList(list.id).removeItem(writeItem(list.id, item.id));
+      await removeItems(writeList(list.id), [writeItem(list.id, item.id)]);
       lists = await afterWrite();
       return out({
         ok: true,
         list: summary(resolveList(lists, list.id)),
         removed: { id: item.id, name: item.name },
+        api: syncMeta(),
       });
     }
 
@@ -336,13 +390,13 @@ async function main() {
       const item = findItem(list, name);
       if (!item) fail(`Item "${name}" not found in list "${list.name}"`);
       const target = writeItem(list.id, item.id);
-      target.checked = action === 'check';
-      await target.save();
+      await saveItems(writeList(list.id), [{ item: target, fields: [{ field: 'checked', value: action === 'check' }] }]);
       lists = await afterWrite();
       return out({
         ok: true,
         list: summary(resolveList(lists, list.id)),
         item: resolveList(lists, list.id).items.find(i => i.id === item.id),
+        api: syncMeta(),
       });
     }
 
@@ -352,15 +406,17 @@ async function main() {
       const wanted = specs.map(s => (typeof s === 'string' ? s : s.name)).filter(Boolean);
       const removed = [];
       const missing = [];
+      const targets = [];
       for (const name of wanted) {
         const item = findItem(list, name);
         if (!item) {
           missing.push(name);
           continue;
         }
-        await writeList(list.id).removeItem(writeItem(list.id, item.id));
+        targets.push(writeItem(list.id, item.id));
         removed.push(item.name);
       }
+      await removeItems(writeList(list.id), targets);
       lists = await afterWrite();
       return out({
         ok: true,
@@ -368,23 +424,22 @@ async function main() {
         removedCount: removed.length,
         removed,
         missing,
+        api: syncMeta(),
       });
     }
 
     case 'clear-checked': {
       const list = resolveList(lists, listArg);
       const checked = list.items.filter(i => i.checked);
-      const removed = [];
-      for (const item of checked) {
-        await writeList(list.id).removeItem(writeItem(list.id, item.id));
-        removed.push(item.name);
-      }
+      const removed = checked.map(i => i.name);
+      await removeItems(writeList(list.id), checked.map(i => writeItem(list.id, i.id)));
       lists = await afterWrite();
       return out({
         ok: true,
         list: summary(resolveList(lists, list.id)),
         removedCount: removed.length,
         removed,
+        api: syncMeta(),
       });
     }
 

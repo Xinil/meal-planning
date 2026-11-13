@@ -81,6 +81,21 @@ encoded `y` / `n`). `List#addItem` / `removeItem` use `add-shopping-list-item` /
 To expose a new mutable item field, extend `OP_MAPPING` and the encode in the patch module — a
 new operation name alone will not be applied server-side.
 
+## Request economics
+
+`data/user-data/get` is a full account download, and the vendor treats heavy use as abuse
+(accounts get an "excessive downloading" email plus a temporary pause). Two rules keep the
+client cheap:
+
+- **Reads** come from `anylist-cache.js`: 15 min TTL, one blob per account on disk, a
+  rolling-hour cap (`ANYLIST_MAX_SYNCS_PER_HOUR`, default 10) and a minimum gap between
+  opportunistic syncs (`ANYLIST_MIN_SYNC_INTERVAL_MS`, default 45 s). Forced syncs (write
+  verification, `--fresh`) bypass the gap but still count against the cap.
+- **Writes** are batched: `addItems()` / `removeItems()` / `saveItems()` in
+  `anylist-patch.js` pack N `PBListOperation`s into one POST, so adding a 13-ingredient
+  recipe costs one write, not thirteen. The library's own `List#addItem` / `Item#save`
+  remain the per-item fallback (`ANYLIST_BATCH_WRITES=0`).
+
 ## Verification pattern
 
 Write, invalidate the sync cache, force a fresh read, then assert the field came back:

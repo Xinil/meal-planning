@@ -6,7 +6,7 @@ dayjs.extend(utc);
 
 // USAGE: 
 //   node meals.js history
-//   node meals.js upcoming
+//   node meals.js upcoming [--days N] [--fresh]
 //   node meals.js candidates
 //   node meals.js add "2026-02-12" "Broccoli Cheddar Risotto"
 //   node meals.js ingredients "Broccoli Cheddar Risotto"   (JSON: recipe ingredient list)
@@ -22,7 +22,11 @@ let syncCache = null;
 
 async function main() {
   await any.login(false); // no websocket: one-shot CLI
-  syncCache = installSyncCache(any, { ttlMs: Number(process.env.ANYLIST_CACHE_TTL_MS || 300000) });
+  syncCache = installSyncCache(any, {
+    ttlMs: Number(process.env.ANYLIST_CACHE_TTL_MS || 900000),
+    maxPerHour: Number(process.env.ANYLIST_MAX_SYNCS_PER_HOUR || 10),
+    minIntervalMs: Number(process.env.ANYLIST_MIN_SYNC_INTERVAL_MS || 45000),
+  });
   // Load massive metadata blob (needed for IDs and settings); served from the disk
   // cache when fresh so back-to-back commands don't trip the sync rate limit.
   await any.getRecipes(false);
@@ -43,7 +47,8 @@ async function main() {
 
   // --- HELPER: Fetch & Format Events ---
   async function getEvents(startDate, endDate) {
-    const events = await any.getMealPlanningCalendarEvents(false); // reuse cached blob when fresh
+    const fresh = process.argv.includes('--fresh');
+    const events = await any.getMealPlanningCalendarEvents(fresh); // cached unless --fresh
     return events.filter(item => {
       if (!item.date) return false;
       const d = dayjs(item.date);

@@ -59,7 +59,7 @@ named explicitly.
 
 ```bash
 node groceries.js lists                       # all lists: id, name, item/checked counts
-node groceries.js items                       # default list, every item
+node groceries.js items [--fresh]             # default list, every item
 node groceries.js items "<list>"              # a specific list (name or id)
 node groceries.js items "<list>" --unchecked  # what still needs buying
 node groceries.js add "<list>" "Milk" --qty "1 gal" --details "2%" [--category dairy]
@@ -136,12 +136,26 @@ Notes for this flow:
 
 ## Pitfalls & best practices
 
-- **Rate limits are real and brutal.** `/data/user-data/get` (full sync) returns
-  `429 {"error":"sync_rate_limited","retry_after":<seconds>}` — often ~1 hour — after a burst of
-  calls. Mitigations already in place: `anylist-cache.js` reuses a sync blob for
-  `ANYLIST_CACHE_TTL_MS` (default 5 min) so read commands cost nothing, writes invalidate it, and
-  `add-many`/`remove-many` fold N items into one command. Still: never loop the CLI per item, and
-  on 429 report `retryAfterMinutes` to the user instead of retrying in a hot loop.
+- **Rate limits are real and brutal.** `/data/user-data/get` is a *full* download of the
+  account (lists, recipes, calendar) and AnyList polices it hard: exceeding it returns
+  `429 {"error":"sync_rate_limited","retry_after":<seconds>}` (an hour is typical) and the vendor
+  also emails the account owner about "excessive downloading" and pauses API access. One observed
+  trigger: roughly 40 syncs in 25 minutes. Every command here is budgeted:
+
+  | Command | Syncs | Writes |
+  | --- | --- | --- |
+  | `lists` / `items` within the 15 min cache window | 0 | 0 |
+  | the same after the cache expires | 1 | 0 |
+  | `add-many` of N ingredients (cache warm) | 1 (verification) | 1 for all N |
+  | `add-many` of N ingredients (cache cold) | 2 | 1 for all N |
+  | `check` / `uncheck` / `remove-many` | 1-2 | 1 |
+
+  Knobs (env, all optional): `ANYLIST_CACHE_TTL_MS` (default 900000 = 15 min),
+  `ANYLIST_MAX_SYNCS_PER_HOUR` (default 10), `ANYLIST_MIN_SYNC_INTERVAL_MS` (default 45000).
+  Over budget, reads fall back to the cached blob and say so (`api.stale`, `api.dataAgeSeconds`);
+  if there is no blob to fall back on you get a clean `retryAfterMinutes` instead of a 429.
+  Every command reports its own `api` block — read it before claiming data is fresh.
+  Never loop the CLI per item. Use `--fresh` on a read only when the user needs live data now.
 - **User id injection.** The library never sets `any.uid`, so write operations go out with
   `userId: undefined` and are rejected. Every script resolves
   `_userData.listSettingsResponse.settings[0].userId` and assigns `any.uid` *before* `getLists()`
@@ -172,7 +186,8 @@ Notes for this flow:
   (e.g. `"4-6"`, `"8"`) as well as rating when cooking for a crowd.
 - **Text notes vs recipes:** meal kit services, takeout, and one-off notes go through
   `meals.js add` as all-day text entries; no cookbook entry needed.
-- **Self-check:** `node test-categorize.js` runs the category map against ~33 known cases.
+- **Self-check:** `npm test` runs the category map (~33 cases) and the sync cache/budget tests
+  (cache hits, min interval, hourly cap, stale fallback) — no network or credentials needed.
 
 ## Files
 
@@ -184,4 +199,5 @@ Notes for this flow:
 | `anylist-cache.js` | sync-blob disk cache + 429 error shaping |
 | `categorize.js` | item-name → category slug rules |
 | `test-categorize.js` | offline category regression test (`npm test`) |
+| `test-sync-budget.js` | offline regression test for the sync cache/budget (`npm test`) |
 | `references/api-internals.md` | schema, endpoints, operation handlers — read this before extending |
