@@ -11,6 +11,7 @@
  *   node groceries.js add <list> <item name> [--qty Q] [--details D] [--category slug]
  *   node groceries.js add-many <list> (--file f.json | --json '<json>' | --stdin)
  *   node groceries.js check|uncheck <list> <item name>
+ *   node groceries.js check-many|uncheck-many <list> (--file f.json | --json '["a","b"]' | --stdin)
  *   node groceries.js remove <list> <item name>
  *   node groceries.js remove-many <list> (--file f.json | --json '["a","b"]' | --stdin)
  *   node groceries.js clear-checked <list>
@@ -400,6 +401,39 @@ async function main() {
       });
     }
 
+    case 'check-many':
+    case 'uncheck-many': {
+      const list = resolveList(lists, listArg);
+      const specs = readSpecs(flags);
+      const wanted = specs.map(s => (typeof s === 'string' ? s : s.name)).filter(Boolean);
+      const targets = [];
+      const changed = [];
+      const missing = [];
+      for (const name of wanted) {
+        const item = findItem(list, name);
+        if (!item) {
+          missing.push(name);
+          continue;
+        }
+        targets.push({
+          item: writeItem(list.id, item.id),
+          fields: [{ field: 'checked', value: action === 'check-many' }],
+        });
+        changed.push(item.name);
+      }
+      // one POST for every item — 26 separate `check` calls would spend 26 syncs
+      if (targets.length) await saveItems(writeList(list.id), targets);
+      lists = await afterWrite();
+      return out({
+        ok: true,
+        list: summary(resolveList(lists, list.id)),
+        changedCount: changed.length,
+        changed,
+        missing,
+        api: syncMeta(),
+      });
+    }
+
     case 'remove-many': {
       const list = resolveList(lists, listArg);
       const specs = readSpecs(flags);
@@ -444,7 +478,7 @@ async function main() {
     }
 
     default:
-      fail(`Unknown command "${action}". Expected: lists | items | add | add-many | check | uncheck | remove | remove-many | clear-checked`);
+      fail(`Unknown command "${action}". Expected: lists | items | add | add-many | check | uncheck | check-many | uncheck-many | remove | remove-many | clear-checked`);
   }
 }
 

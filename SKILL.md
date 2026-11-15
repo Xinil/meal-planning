@@ -13,6 +13,9 @@ Load this whenever the request touches the user's AnyList account:
 - recipes: "what can I make", "does that recipe have ingredients saved", "which recipes are missing ingredients"
 - meal planning: "add <meal> to Thursday", "what's for dinner next week", "remove that meal"
 - the combined ask: "add <meal> to <day> and put its ingredients on my grocery list"
+- buying the list: putting unchecked items into a Kroger-family store cart is the `kroger` skill;
+  it consumes `groceries.js items --unchecked` directly, so read the list here and hand it over
+  rather than re-typing item names
 
 Unrelated to-dos (home projects, packing lists) also live in AnyList lists, so "add X to my
 Home Depot list" is in scope via `groceries.js` with the list named explicitly.
@@ -25,6 +28,36 @@ They talk to AnyList's reverse-engineered private API via the vendored
 | --- | --- |
 | `groceries.js` | shopping lists: read items, add / check / remove items |
 | `meals.js` | meal-planning calendar: history, upcoming, add/delete meals, recipe ingredients |
+
+## This directory is a published git repo
+
+`/opt/data/skills/anylist` is the working copy of **https://github.com/Xinil/meal-planning**
+(`origin`, branch `main`; annotated tags carry releases — `v1.0.0` groceries CLI, `v1.1.0` sync
+budget + batched writes). Edit files here, then commit and push: the repo is the copy the user
+keeps, so an uncommitted change exists on this machine only.
+
+```bash
+cd /opt/data/skills/anylist
+npm test                      # offline suites must be green before committing
+git add SKILL.md groceries.js meals.js anylist-patch.js anylist-cache.js categorize.js \
+  test-categorize.js test-sync-budget.js package.json package-lock.json references/
+git commit -F - <<'EOF'
+feat: ...
+EOF
+git push origin main
+# only when cutting a release:
+git tag -a v1.2.0 -m "v1.2.0 — ..." && git push origin v1.2.0
+```
+
+- Stage an explicit file list. `node_modules/`, `.cache/`, `.env` and `.anylist_credentials` are
+  gitignored; the old reverse-engineering scratch scripts are excluded locally via
+  `.git/info/exclude`. Never commit credentials or cache blobs.
+- Push auth is an SSH key at `/opt/data/home/.ssh/id_ed25519`, wired through `core.sshCommand` on
+  the repo because OpenSSH resolves `~/.ssh/config` from the *passwd* home (`/opt/data`), not
+  `$HOME` (`/opt/data/home`). A fresh clone that cannot push needs that `core.sshCommand`
+  re-applied — the `github` skill's repo-management reference (§2b) has the full recipe.
+- Prove a release by cloning the tag into a scratch directory and running `npm ci && npm test`
+  there — a push line is not evidence that the tagged tree builds.
 
 ## Setup
 
@@ -66,6 +99,8 @@ node groceries.js add "<list>" "Milk" --qty "1 gal" --details "2%" [--category d
 node groceries.js add-many --json '[{"name":"Milk","quantity":"1 gal"}]'   # default list
 node groceries.js check "<list>" "Milk"       # cross an item off
 node groceries.js uncheck "<list>" "Milk"
+node groceries.js check-many "<list>" (--file f.json | --json '["a","b"]' | --stdin)   # one write
+node groceries.js uncheck-many "<list>" (same input)
 node groceries.js remove "<list>" "Milk"
 node groceries.js remove-many "<list>" --json '["Milk","Eggs"]'
 node groceries.js clear-checked "<list>"      # delete every crossed-off item
@@ -114,6 +149,34 @@ node meals.js ingredients "<recipe>" [--skip-pantry]
 Section headings inside a recipe are filtered out. `--skip-pantry` drops staples
 (salt, pepper, oils, flour, sugar, water, butter) so a push doesn't litter the list.
 
+## Workflow: plan a week of dinners
+
+The ask is "plan next week", usually with some nights already spoken for (a meal-kit service
+covers 3 of them, the user names one meal, a night stays empty). Do not fill nights nobody asked
+for.
+
+1. **Anchor the dates.** `date "+%Y-%m-%d %A"` for today, then plan the *next* week's calendar
+   week (Mon–Sun). Pass bare `YYYY-MM-DD` strings to `meals.js`; it stores UTC midnight and
+   formats with `dayjs.utc`, so hand-converting a PT evening to a date is what shifts a day.
+2. **Read once, both views, in one shell call** — `history` then `upcoming` in the same
+   invocation share the sync cache (one sync). `recipes` / `candidates` cost a sync each, so run
+   them in the same call too, redirecting to files you then query with `node -e`.
+3. **Build the exclusion list** from `history` (60 days): skip anything cooked in the last ~3
+   weeks, and skip the *genre*, not just the exact title — the user pushes back on "too much pizza
+   lately", so a week with pizza already in it should not get another flatbread/pizza, and pasta
+   twice in a week reads as lazy. Leave the meal-kit entries (`Marley Spoon`, takeout notes) alone;
+   they are the nights being covered.
+4. **Pick** from `candidates` (rating 4–5) cross-checked against the `recipes` index for variety
+   against the exclusion list, and for leftovers value on a weekend night. Nod to the season when
+   it is obvious (chili, soup, braises in November).
+5. **Write one date at a time**, sleeping 45–60s between writes (see Pitfalls → consecutive
+   writes). Confirm each add is a real recipe link, not a text note.
+6. **Swap = delete then add**, not edit: `meals.js delete "<date>" "<old>"`, wait, then `add`.
+7. **Verify and report.** `meals.js upcoming --days 10` must show the new meals. Reply with a
+   day/meal table, the rating of each pick, and the recent meals it was chosen *against*, plus 2–4
+   named swap options — the user edits the picks rather than re-briefing from scratch.
+   Push ingredients only when asked; the default is calendar-only.
+
 ## Workflow: meal on the calendar + ingredients on the grocery list
 
 The user phrase is usually "add <meal> to <day> and put the ingredients on my list".
@@ -148,7 +211,8 @@ Notes for this flow:
   | the same after the cache expires | 1 | 0 |
   | `add-many` of N ingredients (cache warm) | 1 (verification) | 1 for all N |
   | `add-many` of N ingredients (cache cold) | 2 | 1 for all N |
-  | `check` / `uncheck` / `remove-many` | 1-2 | 1 |
+  | `check` / `uncheck` | 1-2 | 1 |
+| `check-many` / `uncheck-many` of N items | 1-2 | 1 for all N |
 
   Knobs (env, all optional): `ANYLIST_CACHE_TTL_MS` (default 900000 = 15 min),
   `ANYLIST_MAX_SYNCS_PER_HOUR` (default 10), `ANYLIST_MIN_SYNC_INTERVAL_MS` (default 45000).
@@ -186,6 +250,23 @@ Notes for this flow:
   (e.g. `"4-6"`, `"8"`) as well as rating when cooking for a crowd.
 - **Text notes vs recipes:** meal kit services, takeout, and one-off notes go through
   `meals.js add` as all-day text entries; no cookbook entry needed.
+- **A wrong recipe name fails silently into a text note.** `meals.js add` prints
+  `Found recipe: "<name>"` only when it links a cookbook entry; otherwise it creates an all-day
+  text entry and still reports success. Recipe titles are matched byte-for-byte and many contain
+  typographic apostrophes (`Jeffrey’s Blue Ribbon Chili` uses U+2019, not `'`), so copy the exact
+  string out of `meals.js recipes` instead of retyping it, and treat a missing `Found recipe:`
+  line as a failure to fix (delete the note, re-add with the indexed spelling).
+- **Consecutive writes trip the min-sync-interval budget.** Every `add` / `delete` is a write, and
+  a write cannot fall back to the cache the way a read can: back-to-back commands seconds apart
+  return `{"ok":false,"error":"sync budget spent: ...","retryAfterSeconds":N}`. Sleep ~45–60s
+  between writes, and on that error wait out the reported `retryAfterSeconds` (plus a few seconds)
+  and re-run the *same* command — the retry succeeds, and re-running a duplicate `add`/`delete`
+  that partially landed is harmless. Prefer one batched shell command for all the session's reads
+  over one call per read; each separate call buys another sync.
+- **Crossing off a shopped list: use `check-many`, never a loop of `check`.** One write for
+  all N items; 26 separate `check` calls spend 26 writes and trip the min-interval budget.
+  Pass the item names exactly as AnyList stores them (recipe noise and typographic characters
+  included) — read them from `items --unchecked` and feed the JSON back rather than retyping.
 - **Self-check:** `npm test` runs the category map (~33 cases) and the sync cache/budget tests
   (cache hits, min interval, hourly cap, stale fallback) — no network or credentials needed.
 
