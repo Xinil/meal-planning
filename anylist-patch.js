@@ -46,6 +46,17 @@ function splitQuantity(quantity) {
   };
 }
 
+function ingredientOf(item) {
+  // An item added from a recipe (meal plan -> list) keeps its amount on the
+  // linked ingredient: the ListItem's own quantityPb is null, and the app still
+  // renders "Italian Sausage (2 lb)". Read both places.
+  const groups = (item && item.ingredients) || [];
+  return groups.find(g => g && g.quantityPb && g.quantityPb.rawQuantity)
+      || groups.find(g => g && g.ingredient && g.ingredient.quantity)
+      || groups[0]
+      || null;
+}
+
 function quantityToString(item) {
   if (!item) return undefined;
   if (item.quantityPb && item.quantityPb.rawQuantity) return item.quantityPb.rawQuantity;
@@ -55,6 +66,22 @@ function quantityToString(item) {
     if (joined) return joined;
   }
   if (item.deprecatedQuantity) return item.deprecatedQuantity;
+  const group = ingredientOf(item);
+  if (group) {
+    if (group.quantityPb && group.quantityPb.rawQuantity) return group.quantityPb.rawQuantity;
+    if (group.quantityPb) {
+      const joined = [group.quantityPb.amount, group.quantityPb.unit].filter(Boolean).join(' ').trim();
+      if (joined) return joined;
+    }
+    if (group.ingredient && group.ingredient.quantity) return String(group.ingredient.quantity).trim();
+  }
+  return undefined;
+}
+
+/** Prep note carried by a recipe-linked item ("sliced into 1/2 inch pieces"). */
+function noteToString(item) {
+  const group = ingredientOf(item);
+  if (group && group.ingredient && group.ingredient.note) return group.ingredient.note;
   return undefined;
 }
 
@@ -97,7 +124,9 @@ function rawLists(any) {
       name: item.name,
       quantity: quantityToString(item),
       details: item.details || undefined,
-      rawIngredient: item.rawIngredient || undefined,
+      note: noteToString(item),
+      rawIngredient: item.rawIngredient || (ingredientOf(item) || {}).ingredient
+        && (ingredientOf(item) || {}).ingredient.rawIngredient || undefined,
       recipeId: item.recipeId || undefined,
       checked: item.checked === true,
       category: item.category || undefined,
@@ -245,6 +274,8 @@ module.exports = {
   itemSummary,
   splitQuantity,
   quantityToString,
+  noteToString,
+  ingredientOf,
   addItems,
   removeItems,
   saveItems,

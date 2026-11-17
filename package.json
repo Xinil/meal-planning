@@ -4,7 +4,7 @@
   "description": "CLI + agent skill for AnyList grocery lists, recipes, and the meal-planning calendar (unofficial API)",
   "private": true,
   "scripts": {
-    "test": "node test-categorize.js && node test-sync-budget.js"
+    "test": "node test-categorize.js && node test-quantity.js && node test-sync-budget.js"
   },
   "keywords": [
     "anylist",

@@ -229,6 +229,13 @@ Notes for this flow:
   `ListItem#quantity is not a field`. `anylist-patch.js` re-implements `_encode` against the real
   schema and reads `quantityPb.rawQuantity` back on read. Both scripts require it before touching
   the library — keep that require order if you edit them, and re-check after any `npm update`.
+- **Recipe-linked items keep their amount on the ingredient, not the item.** An item pushed from
+  a recipe (meal plan → list) has `ListItem.quantityPb = null` while
+  `ingredients[0].quantityPb.rawQuantity` holds `"2 lb"` — the app still renders
+  "Italian Sausage (2 lb)", so reading only the item-level field makes a 2 lb ingredient look
+  like a bare name. `quantityToString()` in `anylist-patch.js` falls back to the linked ingredient,
+  and `rawLists()` also exposes `note` (the prep text, e.g. "sliced into 1/2 inch pieces") and
+  `rawIngredient`. Regression test: `test-quantity.js` (`npm test`).
 - **Wrapper classes expose only a curated subset of fields.** `quantityPb` (above) and
   `PBIngredient.isHeading` are both dropped by the library's wrappers. When a value is missing
   from `list.items`/`any.recipes`, read the decoded protobuf instead
@@ -279,6 +286,7 @@ Notes for this flow:
 | `anylist-patch.js` | protobuf encode/read fixes for the vendored library |
 | `anylist-cache.js` | sync-blob disk cache + 429 error shaping |
 | `categorize.js` | item-name → category slug rules |
-| `test-categorize.js` | offline category regression test (`npm test`) |
+| `test-categorize.js` | offline category regression test (`npm test`)
+| `test-quantity.js` | offline regression test for item/ingredient quantity reads (`npm test`) |
 | `test-sync-budget.js` | offline regression test for the sync cache/budget (`npm test`) |
 | `references/api-internals.md` | schema, endpoints, operation handlers — read this before extending |
